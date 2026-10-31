@@ -12,17 +12,28 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.BufferedReader;
+import java.io.Closeable;
+import java.io.FileReader;
+import java.io.InputStreamReader;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.LinkedHashSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Muestra la IP de la TV y el estado de la depuración, y tiene botones que
- * intentan abrir las opciones de desarrollador por distintas rutas.
- * Funciona con control remoto (los botones son enfocables).
+ * Muestra la IP de la TV, el estado de la depuración y si el ADB por red
+ * (puerto 5555) esta activo, y tiene botones que intentan abrir las opciones
+ * de desarrollador por distintas rutas. Funciona con control remoto.
  */
 public class MainActivity extends Activity {
+
+    private static final Pattern FIB_IP = Pattern.compile("\\|--\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)");
+    private static final Pattern CMD_IP = Pattern.compile("inet(?: addr:)?\\s*(\\d+\\.\\d+\\.\\d+\\.\\d+)");
 
     private TextView info;
     private TextView status;
@@ -37,7 +48,7 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Dev Opener v2");
+        title.setText("Dev Opener v3");
         title.setTextSize(26);
         root.addView(title);
 
@@ -120,40 +131,153 @@ public class MainActivity extends Activity {
     private void refreshInfo() {
         StringBuilder sb = new StringBuilder();
         sb.append("IP de esta TV (wlan0 = Wi-Fi, eth0 = cable):\n");
-        sb.append(findIps());
+        ArrayList<String> ips = findIps();
+        if (ips.isEmpty()) {
+            sb.append("  No se pudo leer la IP.\n");
+        } else {
+            for (String s : ips) {
+                sb.append("  ").append(s).append("\n");
+            }
+        }
         int adb = Settings.Global.getInt(getContentResolver(), Settings.Global.ADB_ENABLED, 0);
         sb.append("\nDepuración USB: ").append(adb == 1 ? "ACTIVADA" : "desactivada").append("\n");
+        sb.append("ADB por red (puerto 5555): ").append(portStatus()).append("\n");
         sb.append("Android ").append(Build.VERSION.RELEASE)
                 .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
         sb.append("Para conectar desde la PC: adb connect IP:5555");
         info.setText(sb.toString());
     }
 
-    private String findIps() {
-        StringBuilder sb = new StringBuilder();
+    /** Busca las IPv4 de la TV con varios metodos que no necesitan permisos. */
+    private ArrayList<String> findIps() {
+        LinkedHashSet<String> out = new LinkedHashSet<String>();
+
+        // Metodo 1: interfaces de red de Java (cada interfaz por separado).
         try {
             Enumeration<NetworkInterface> nis = NetworkInterface.getNetworkInterfaces();
             while (nis != null && nis.hasMoreElements()) {
                 NetworkInterface ni = nis.nextElement();
-                if (!ni.isUp() || ni.isLoopback()) {
-                    continue;
-                }
-                Enumeration<InetAddress> addrs = ni.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress a = addrs.nextElement();
-                    if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
-                        sb.append("  ").append(ni.getName()).append(": ")
-                                .append(a.getHostAddress()).append("\n");
+                try {
+                    Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                    while (addrs.hasMoreElements()) {
+                        InetAddress a = addrs.nextElement();
+                        if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                            out.add(ni.getName() + ": " + a.getHostAddress());
+                        }
                     }
+                } catch (Exception ignored) {
+                    // se ignora esta interfaz y se sigue con la siguiente
                 }
             }
+        } catch (Exception ignored) {
+            // se prueba el siguiente metodo
+        }
+
+        // Metodo 2: tabla de rutas del kernel.
+        if (out.isEmpty()) {
+            BufferedReader r = null;
+            try {
+                r = new BufferedReader(new FileReader("/proc/net/fib_trie"));
+                String line;
+                String last = null;
+                while ((line = r.readLine()) != null) {
+                    Matcher m = FIB_IP.matcher(line);
+                    if (m.find()) {
+                        last = m.group(1);
+                    } else if (last != null && line.contains("/32 host LOCAL")) {
+                        if (!last.startsWith("127.")) {
+                            out.add(last);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // se prueba el siguiente metodo
+            } finally {
+                closeQuietly(r);
+            }
+        }
+
+        // Metodo 3: comandos del sistema.
+        if (out.isEmpty()) {
+            addIpsFromText(out, runCmd("ip", "-4", "addr"));
+        }
+        if (out.isEmpty()) {
+            addIpsFromText(out, runCmd("ifconfig"));
+        }
+
+        return new ArrayList<String>(out);
+    }
+
+    private void addIpsFromText(LinkedHashSet<String> out, String text) {
+        Matcher m = CMD_IP.matcher(text);
+        while (m.find()) {
+            String ip = m.group(1);
+            if (!ip.startsWith("127.")) {
+                out.add(ip);
+            }
+        }
+    }
+
+    private String runCmd(String... cmd) {
+        Process p = null;
+        BufferedReader r = null;
+        try {
+            p = Runtime.getRuntime().exec(cmd);
+            r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+            return sb.toString();
         } catch (Exception e) {
-            sb.append("  Error al leer la red (").append(e.getClass().getSimpleName()).append(")\n");
+            return "";
+        } finally {
+            closeQuietly(r);
+            if (p != null) {
+                p.destroy();
+            }
         }
-        if (sb.length() == 0) {
-            return "  No se encontró IP. Revisa que la TV esté conectada a la red.\n";
+    }
+
+    /** Mira si algun programa esta escuchando en el puerto 5555 (0x15B3). */
+    private String portStatus() {
+        boolean readable = false;
+        boolean listening = false;
+        String[] files = {"/proc/net/tcp", "/proc/net/tcp6"};
+        for (String f : files) {
+            BufferedReader r = null;
+            try {
+                r = new BufferedReader(new FileReader(f));
+                readable = true;
+                String line = r.readLine();
+                while ((line = r.readLine()) != null) {
+                    String[] p = line.trim().split("\\s+");
+                    if (p.length > 3 && "0A".equals(p[3])
+                            && p[1].toUpperCase().endsWith(":15B3")) {
+                        listening = true;
+                    }
+                }
+            } catch (Exception ignored) {
+                // no se pudo leer este archivo
+            } finally {
+                closeQuietly(r);
+            }
         }
-        return sb.toString();
+        if (!readable) {
+            return "no se pudo comprobar";
+        }
+        return listening ? "ACTIVO" : "CERRADO";
+    }
+
+    private static void closeQuietly(Closeable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (Exception ignored) {
+                // nada que hacer
+            }
+        }
     }
 
     private Button addButton(LinearLayout parent, String label, View.OnClickListener listener) {
