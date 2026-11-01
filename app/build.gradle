@@ -6,12 +6,24 @@ android {
     namespace 'com.example.devopener'
     compileSdk 34
 
+    // Llave de firma fija: así cada versión nueva se instala encima de la anterior.
+    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storeType 'jks'
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
     defaultConfig {
-        applicationId 'com.example.devopener3'
+        applicationId 'com.example.milauncher'
         minSdk 21
-        targetSdk 33
-        versionCode 3
-        versionName '3.0'
+        // 22: en Android 6 los permisos (leer la carpeta Fondos) se conceden al instalar.
+        targetSdk 22
+        versionCode 5
+        versionName '5.0'
     }
 
     compileOptions {

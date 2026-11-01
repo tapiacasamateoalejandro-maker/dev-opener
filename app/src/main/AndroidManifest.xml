@@ -15,17 +15,42 @@
         android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- Para leer fondos desde la carpeta "Fondos" (USB o almacenamiento). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+    <!-- Para desinstalar apps desde el launcher (necesario en Android 8 o superior). -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
     <application
         android:allowBackup="false"
         android:icon="@android:drawable/sym_def_app_icon"
-        android:label="Dev Opener"
+        android:label="Mi Launcher"
         android:theme="@android:style/Theme.DeviceDefault">
 
+        <!-- Herramienta para abrir las opciones de desarrollador y ver la IP. -->
         <activity
             android:name=".MainActivity"
+            android:label="Opciones Dev"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Launcher: aparece como app normal y también como opción de pantalla de inicio. -->
+        <activity
+            android:name=".LauncherActivity"
+            android:label="Mi Launcher"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:stateNotNeeded="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.LAUNCHER" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
