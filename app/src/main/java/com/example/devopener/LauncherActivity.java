@@ -58,11 +58,10 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Launcher estilo tvOS: reloj, posters grandes que se agrandan al enfocarlos,
- * modo para reordenar apps con el control y un fondo de imagen o video que
- * se puede elegir desde dentro de la app o poner en una carpeta "Fondos"
- * (en una memoria USB o en el almacenamiento de la TV). Sin fondo propio,
- * usa un degradado animado.
+ * Launcher estilo tvOS/Play, con tres pantallas (pestañas arriba): Apps,
+ * Entradas y Ajustes. Fondo de imagen o video elegido desde la app o desde
+ * una carpeta "Fondos" (USB o almacenamiento); sin fondo propio usa un
+ * degradado animado.
  */
 public class LauncherActivity extends Activity {
 
@@ -73,6 +72,12 @@ public class LauncherActivity extends Activity {
     private static final String PREFS = "launcher_prefs";
     private static final String KEY_ORDER = "orden_apps";
 
+    private static final int TAB_APPS = 0;
+    private static final int TAB_INPUTS = 1;
+    private static final int TAB_SETTINGS = 2;
+    private static final String[] TAB_LABELS = {"Aplicaciones", "Entradas", "Ajustes"};
+    private static final int[] TAB_COLORS = {0xFF3DDC84, 0xFFFFA726, 0xFFBB86FC};
+
     private static final int KIND_APP = 0;
     private static final int KIND_SPECIAL = 1;
     private static final int KIND_UNINSTALL_ON = 2;
@@ -80,6 +85,7 @@ public class LauncherActivity extends Activity {
     private static final int KIND_MOVE_ON = 4;
     private static final int KIND_MOVE_OFF = 5;
     private static final int KIND_PICK_BG = 6;
+    private static final int KIND_INFO = 7;
 
     private static class Entry {
         String label;
@@ -99,10 +105,14 @@ public class LauncherActivity extends Activity {
 
     private FrameLayout bgFrame;
     private VideoView videoView;
+    private LinearLayout tabBar;
+    private TextView[] tabViews = new TextView[TAB_LABELS.length];
+    private View[] tabUnderlines = new View[TAB_LABELS.length];
     private GridView grid;
     private TextView banner;
     private TextView infoText;
     private EntryAdapter adapter;
+    private int currentTab = TAB_APPS;
     private boolean selectFirstNext = true;
     private boolean uninstallMode = false;
     private boolean moveMode = false;
@@ -129,19 +139,71 @@ public class LauncherActivity extends Activity {
         content.setPadding(dp(48), dp(32), dp(48), dp(24));
         root.addView(content, new FrameLayout.LayoutParams(MATCH, MATCH));
 
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        content.addView(header, new LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout clockBox = new LinearLayout(this);
+        clockBox.setOrientation(LinearLayout.VERTICAL);
         TextClock time = new TextClock(this);
         time.setFormat24Hour("HH:mm");
         time.setFormat12Hour("HH:mm");
-        time.setTextSize(56);
+        time.setTextSize(44);
         time.setTextColor(Color.WHITE);
-        content.addView(time);
-
+        clockBox.addView(time);
         TextClock date = new TextClock(this);
         date.setFormat24Hour("EEEE, d 'de' MMMM");
         date.setFormat12Hour("EEEE, d 'de' MMMM");
-        date.setTextSize(20);
+        date.setTextSize(16);
         date.setTextColor(0xCCFFFFFF);
-        content.addView(date);
+        clockBox.addView(date);
+        header.addView(clockBox, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        tabBar = new LinearLayout(this);
+        tabBar.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < TAB_LABELS.length; i++) {
+            final int idx = i;
+            LinearLayout box = new LinearLayout(this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setGravity(Gravity.CENTER_HORIZONTAL);
+            box.setPadding(dp(18), dp(6), dp(18), dp(4));
+
+            TextView t = new TextView(this);
+            t.setText(TAB_LABELS[i]);
+            t.setTextSize(18);
+            t.setTextColor(0xAAFFFFFF);
+            t.setFocusable(true);
+            t.setFocusableInTouchMode(true);
+            t.setClickable(true);
+            t.setPadding(dp(4), dp(4), dp(4), dp(4));
+            t.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    switchTab(idx);
+                }
+            });
+            t.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                @Override
+                public void onFocusChange(View v, boolean hasFocus) {
+                    if (hasFocus) {
+                        switchTab(idx);
+                    }
+                }
+            });
+            box.addView(t);
+
+            View underline = new View(this);
+            LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(MATCH, dp(3));
+            ulp.topMargin = dp(4);
+            box.addView(underline, ulp);
+
+            tabViews[i] = t;
+            tabUnderlines[i] = underline;
+            tabBar.addView(box);
+        }
+        header.addView(tabBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
 
         banner = new TextView(this);
         banner.setTextSize(18);
@@ -193,6 +255,7 @@ public class LauncherActivity extends Activity {
         content.addView(infoText);
 
         setContentView(root);
+        updateTabsUi();
         grid.requestFocus();
     }
 
@@ -232,6 +295,8 @@ public class LauncherActivity extends Activity {
             setUninstallMode(false);
         } else if (moveMode) {
             setMoveMode(false);
+        } else if (currentTab != TAB_APPS) {
+            tabViews[TAB_APPS].requestFocus();
         }
     }
 
@@ -265,7 +330,37 @@ public class LauncherActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // Modo desinstalar / modo mover
+    // Pestañas (pantallas)
+    // ------------------------------------------------------------------
+
+    private void switchTab(int tab) {
+        boolean changed = tab != currentTab;
+        currentTab = tab;
+        if (changed) {
+            uninstallMode = false;
+            moveMode = false;
+            pickedPosition = -1;
+            banner.setVisibility(View.GONE);
+        }
+        updateTabsUi();
+        if (changed) {
+            selectFirstNext = true;
+            grid.setAlpha(0.15f);
+            loadEntries();
+        }
+    }
+
+    private void updateTabsUi() {
+        for (int i = 0; i < TAB_LABELS.length; i++) {
+            boolean sel = i == currentTab;
+            tabViews[i].setTextColor(sel ? Color.WHITE : 0x99FFFFFF);
+            tabViews[i].setTypeface(null, sel ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+            tabUnderlines[i].setBackgroundColor(sel ? TAB_COLORS[i] : Color.TRANSPARENT);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Modo desinstalar / modo mover (solo en la pantalla de Apps)
     // ------------------------------------------------------------------
 
     private void setUninstallMode(boolean on) {
@@ -308,15 +403,19 @@ public class LauncherActivity extends Activity {
             return;
         }
         if (e.kind == KIND_UNINSTALL_ON) {
+            switchTab(TAB_APPS);
             setUninstallMode(true);
         } else if (e.kind == KIND_UNINSTALL_OFF) {
             setUninstallMode(false);
         } else if (e.kind == KIND_MOVE_ON) {
+            switchTab(TAB_APPS);
             setMoveMode(true);
         } else if (e.kind == KIND_MOVE_OFF) {
             setMoveMode(false);
         } else if (e.kind == KIND_PICK_BG) {
             pickBackground();
+        } else if (e.kind == KIND_INFO) {
+            // no hace nada: solo explica algo en pantalla
         } else if (uninstallMode && e.kind == KIND_APP) {
             uninstall(e);
         } else if (moveMode && e.kind == KIND_APP) {
@@ -383,7 +482,7 @@ public class LauncherActivity extends Activity {
     }
 
     // ------------------------------------------------------------------
-    // Lista de apps y orden guardado
+    // Carga de cada pantalla
     // ------------------------------------------------------------------
 
     private SharedPreferences prefs() {
@@ -412,19 +511,28 @@ public class LauncherActivity extends Activity {
     }
 
     private void loadEntries() {
-        final boolean mode = uninstallMode;
-        final boolean move = moveMode;
+        final int tab = currentTab;
+        final boolean uMode = uninstallMode;
+        final boolean mMode = moveMode;
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final ArrayList<Entry> list = buildEntries(mode, move);
+                final ArrayList<Entry> list;
+                if (tab == TAB_INPUTS) {
+                    list = buildInputsEntries();
+                } else if (tab == TAB_SETTINGS) {
+                    list = buildSettingsEntries();
+                } else {
+                    list = buildAppsEntries(uMode, mMode);
+                }
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        if (mode != uninstallMode || move != moveMode) {
-                            return; // el modo cambio mientras cargaba
+                        if (tab != currentTab || uMode != uninstallMode || mMode != moveMode) {
+                            return; // la pantalla o el modo cambiaron mientras cargaba
                         }
                         adapter.setItems(list);
+                        grid.animate().alpha(1f).setDuration(180).start();
                         if (selectFirstNext) {
                             selectFirstNext = false;
                             grid.setSelection(0);
@@ -436,13 +544,9 @@ public class LauncherActivity extends Activity {
         }).start();
     }
 
-    private ArrayList<Entry> buildEntries(boolean uMode, boolean mMode) {
+    private ArrayList<Entry> buildAppsEntries(boolean uMode, boolean mMode) {
         PackageManager pm = getPackageManager();
         ArrayList<Entry> out = new ArrayList<Entry>();
-
-        if (!uMode && !mMode) {
-            addTvInputs(out);
-        }
 
         LinkedHashMap<String, Entry> apps = new LinkedHashMap<String, Entry>();
         String[] cats = {Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER};
@@ -499,13 +603,31 @@ public class LauncherActivity extends Activity {
         }
 
         out.addAll(sorted);
+        return out;
+    }
+
+    /** Entradas de video (HDMI, AV) que la TV avise al sistema, si las expone. */
+    private ArrayList<Entry> buildInputsEntries() {
+        ArrayList<Entry> out = new ArrayList<Entry>();
+        addTvInputs(out);
+        if (out.isEmpty()) {
+            Entry e = plain("Sin entradas detectadas",
+                    "Esta TV no le avisa a las apps sobre sus entradas HDMI o AV",
+                    android.R.drawable.ic_dialog_info, KIND_INFO);
+            out.add(e);
+        }
+        return out;
+    }
+
+    private ArrayList<Entry> buildSettingsEntries() {
+        ArrayList<Entry> out = new ArrayList<Entry>();
         out.add(plain("Mover apps", "cambiar el orden",
                 android.R.drawable.ic_menu_sort_alphabetically, KIND_MOVE_ON));
         out.add(plain("Desinstalar apps", "quitar apps instaladas",
                 android.R.drawable.ic_menu_delete, KIND_UNINSTALL_ON));
         out.add(plain("Elegir fondo", "imagen o video de tu TV",
                 android.R.drawable.ic_menu_gallery, KIND_PICK_BG));
-        out.add(special("Ajustes", "android.settings.SETTINGS", android.R.drawable.ic_menu_preferences));
+        out.add(special("Ajustes del sistema", "android.settings.SETTINGS", android.R.drawable.ic_menu_preferences));
         out.add(special("Cambiar launcher", "android.settings.HOME_SETTINGS", android.R.drawable.ic_menu_revert));
         return out;
     }
@@ -591,7 +713,7 @@ public class LauncherActivity extends Activity {
                 out.add(e);
             }
         } catch (Throwable ignored) {
-            // la TV no expone entradas al sistema: se usan las apps de la lista
+            // la TV no expone entradas al sistema: se muestra el aviso de "sin entradas"
         }
     }
 
@@ -657,7 +779,7 @@ public class LauncherActivity extends Activity {
 
                 h = new Holder();
                 h.card = new FrameLayout(LauncherActivity.this);
-                h.card.setBackground(makeCard(false, false));
+                h.card.setBackground(makeCard(false, false, TAB_COLORS[TAB_APPS]));
                 FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(108), dp(108));
                 ll.addView(h.card, clp);
 
@@ -686,28 +808,33 @@ public class LauncherActivity extends Activity {
 
             Entry e = items.get(position);
             h.icon.setImageDrawable(e.icon);
+            h.icon.setAlpha(e.kind == KIND_INFO ? 0.6f : 1f);
 
             boolean selected = position == grid.getSelectedItemPosition();
             boolean picked = position == pickedPosition;
+            int accent = TAB_COLORS[currentTab];
 
-            h.card.setBackground(makeCard(selected, picked));
+            h.card.setBackground(makeCard(selected, picked, accent));
             h.card.setScaleX(selected ? 1.18f : 1f);
             h.card.setScaleY(selected ? 1.18f : 1f);
             h.card.setTranslationY(selected ? -dp(6) : 0);
 
             if (e.kind == KIND_APP && uninstallMode) {
                 h.label.setText(e.label + "\n" + shortPkg(e.pkg));
+            } else if (e.kind == KIND_INFO) {
+                h.label.setText(e.label + "\n" + e.detail);
             } else {
                 h.label.setText(e.label);
             }
-            h.label.setVisibility(selected || picked ? View.VISIBLE : View.INVISIBLE);
+            boolean alwaysShow = e.kind == KIND_INFO && items.size() == 1;
+            h.label.setVisibility(selected || picked || alwaysShow ? View.VISIBLE : View.INVISIBLE);
             h.label.setTextColor(picked ? 0xFFFFD54F : Color.WHITE);
 
             return cell;
         }
     }
 
-    private Drawable makeCard(boolean selected, boolean picked) {
+    private Drawable makeCard(boolean selected, boolean picked, int accent) {
         GradientDrawable g = new GradientDrawable();
         g.setCornerRadius(dp(18));
         if (picked) {
@@ -715,7 +842,7 @@ public class LauncherActivity extends Activity {
             g.setStroke(dp(3), 0xFFFFD54F);
         } else if (selected) {
             g.setColor(0x33FFFFFF);
-            g.setStroke(dp(3), 0xFFFFFFFF);
+            g.setStroke(dp(3), accent);
         } else {
             g.setColor(0x1AFFFFFF);
             g.setStroke(dp(1), 0x33FFFFFF);

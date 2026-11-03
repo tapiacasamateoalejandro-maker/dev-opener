@@ -22,8 +22,8 @@ android {
         minSdk 21
         // 22: en Android 6 los permisos (leer la carpeta Fondos) se conceden al instalar.
         targetSdk 22
-        versionCode 6
-        versionName '6.0'
+        versionCode 7
+        versionName '7.0'
     }
 
     compileOptions {
