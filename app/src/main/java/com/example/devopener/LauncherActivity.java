@@ -4,10 +4,12 @@ import android.app.Activity;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
@@ -21,9 +23,11 @@ import android.media.tv.TvInputManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AbsListView;
@@ -48,26 +52,34 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 
 /**
- * Launcher minimalista para TV: reloj, rejilla de apps y entradas de TV.
- * El fondo puede ser una imagen o un video que se coloca en una carpeta
- * llamada "Fondos" (en una memoria USB o en el almacenamiento de la TV).
- * Si no hay ninguno, usa un degradado animado.
+ * Launcher estilo tvOS: reloj, posters grandes que se agrandan al enfocarlos,
+ * modo para reordenar apps con el control y un fondo de imagen o video que
+ * se puede elegir desde dentro de la app o poner en una carpeta "Fondos"
+ * (en una memoria USB o en el almacenamiento de la TV). Sin fondo propio,
+ * usa un degradado animado.
  */
 public class LauncherActivity extends Activity {
 
     private static final String[] VIDEO_EXT = {"mp4", "webm", "mkv", "3gp", "mov"};
     private static final String[] IMAGE_EXT = {"jpg", "jpeg", "png", "webp"};
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+    private static final int REQ_PICK_BG = 501;
+    private static final String PREFS = "launcher_prefs";
+    private static final String KEY_ORDER = "orden_apps";
 
     private static final int KIND_APP = 0;
     private static final int KIND_SPECIAL = 1;
     private static final int KIND_UNINSTALL_ON = 2;
     private static final int KIND_UNINSTALL_OFF = 3;
+    private static final int KIND_MOVE_ON = 4;
+    private static final int KIND_MOVE_OFF = 5;
+    private static final int KIND_PICK_BG = 6;
 
     private static class Entry {
         String label;
@@ -80,6 +92,7 @@ public class LauncherActivity extends Activity {
     }
 
     private static class Holder {
+        FrameLayout card;
         ImageView icon;
         TextView label;
     }
@@ -92,6 +105,8 @@ public class LauncherActivity extends Activity {
     private EntryAdapter adapter;
     private boolean selectFirstNext = true;
     private boolean uninstallMode = false;
+    private boolean moveMode = false;
+    private int pickedPosition = -1;
     private volatile String currentBgKey = null;
 
     @Override
@@ -131,10 +146,7 @@ public class LauncherActivity extends Activity {
         banner = new TextView(this);
         banner.setTextSize(18);
         banner.setTextColor(Color.WHITE);
-        banner.setBackgroundColor(0xCCB71C1C);
         banner.setPadding(dp(16), dp(8), dp(16), dp(8));
-        banner.setText("MODO DESINSTALAR: elige una app para quitarla. "
-                + "Para salir elige \"Salir\" o pulsa Atrás.");
         banner.setVisibility(View.GONE);
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -148,27 +160,28 @@ public class LauncherActivity extends Activity {
 
         grid = new GridView(this);
         grid.setNumColumns(GridView.AUTO_FIT);
-        grid.setColumnWidth(dp(150));
+        grid.setColumnWidth(dp(170));
         grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
-        grid.setVerticalSpacing(dp(12));
-        grid.setHorizontalSpacing(dp(12));
+        grid.setVerticalSpacing(dp(18));
+        grid.setHorizontalSpacing(dp(18));
         grid.setVerticalScrollBarEnabled(false);
-        grid.setPadding(0, dp(24), 0, dp(8));
-        grid.setSelector(makeSelector());
+        grid.setPadding(0, dp(28), 0, dp(8));
+        grid.setSelector(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
         adapter = new EntryAdapter();
         grid.setAdapter(adapter);
         grid.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
-                onEntryClicked(adapter.getItem(position));
+                onEntryClicked(position);
             }
         });
         grid.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
                 Entry e = adapter.getItem(position);
-                String extra = e.detail != null ? "  ·  " + e.detail : "";
+                String extra = e.detail != null && e.kind == KIND_APP ? "  ·  " + e.detail : "";
                 infoText.setText(e.label + extra);
+                adapter.notifyDataSetChanged();
             }
 
             @Override
@@ -209,27 +222,88 @@ public class LauncherActivity extends Activity {
         super.onDestroy();
     }
 
-    /** Un launcher no debe cerrarse con Atras; solo sirve para salir del modo desinstalar. */
+    /** Un launcher no debe cerrarse con Atras; sirve para salir de los modos especiales. */
     @Override
     public void onBackPressed() {
-        if (uninstallMode) {
+        if (pickedPosition != -1) {
+            pickedPosition = -1;
+            adapter.notifyDataSetChanged();
+        } else if (uninstallMode) {
             setUninstallMode(false);
+        } else if (moveMode) {
+            setMoveMode(false);
         }
     }
 
+    /**
+     * Mientras hay una app "levantada" para moverla, las flechas la desplazan
+     * en vez de mover el foco a otra app.
+     */
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (moveMode && pickedPosition != -1) {
+            int delta = 0;
+            if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                delta = 1;
+            } else if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) {
+                delta = -1;
+            } else if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                delta = adapter.columnsEstimate();
+            } else if (keyCode == KeyEvent.KEYCODE_DPAD_UP) {
+                delta = -adapter.columnsEstimate();
+            }
+            if (delta != 0) {
+                movePicked(delta);
+                return true;
+            }
+            if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
+                dropPicked();
+                return true;
+            }
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
     // ------------------------------------------------------------------
-    // Lista de apps y entradas
+    // Modo desinstalar / modo mover
     // ------------------------------------------------------------------
 
     private void setUninstallMode(boolean on) {
         uninstallMode = on;
+        moveMode = false;
+        pickedPosition = -1;
         selectFirstNext = true;
-        banner.setVisibility(on ? View.VISIBLE : View.GONE);
-        infoText.setText("");
+        updateBanner();
         loadEntries();
     }
 
-    private void onEntryClicked(Entry e) {
+    private void setMoveMode(boolean on) {
+        moveMode = on;
+        uninstallMode = false;
+        pickedPosition = -1;
+        selectFirstNext = true;
+        updateBanner();
+        loadEntries();
+    }
+
+    private void updateBanner() {
+        if (uninstallMode) {
+            banner.setBackgroundColor(0xCCB71C1C);
+            banner.setText("DESINSTALAR: elige una app para quitarla. \"Salir\" o Atrás para terminar.");
+            banner.setVisibility(View.VISIBLE);
+        } else if (moveMode) {
+            banner.setBackgroundColor(0xCC1C4FB7);
+            banner.setText(pickedPosition == -1
+                    ? "MOVER APPS: elige una app, y con las flechas cámbiala de lugar."
+                    : "Mueve con las flechas y pulsa OK para soltarla. \"Salir\" o Atrás para terminar.");
+            banner.setVisibility(View.VISIBLE);
+        } else {
+            banner.setVisibility(View.GONE);
+        }
+    }
+
+    private void onEntryClicked(int position) {
+        Entry e = adapter.getItem(position);
         if (e == null) {
             return;
         }
@@ -237,11 +311,49 @@ public class LauncherActivity extends Activity {
             setUninstallMode(true);
         } else if (e.kind == KIND_UNINSTALL_OFF) {
             setUninstallMode(false);
+        } else if (e.kind == KIND_MOVE_ON) {
+            setMoveMode(true);
+        } else if (e.kind == KIND_MOVE_OFF) {
+            setMoveMode(false);
+        } else if (e.kind == KIND_PICK_BG) {
+            pickBackground();
         } else if (uninstallMode && e.kind == KIND_APP) {
             uninstall(e);
+        } else if (moveMode && e.kind == KIND_APP) {
+            if (pickedPosition == position) {
+                dropPicked();
+            } else {
+                pickedPosition = position;
+                updateBanner();
+                adapter.notifyDataSetChanged();
+            }
         } else {
             launch(e);
         }
+    }
+
+    private void dropPicked() {
+        pickedPosition = -1;
+        updateBanner();
+        adapter.notifyDataSetChanged();
+        saveOrder();
+    }
+
+    private void movePicked(int delta) {
+        int from = pickedPosition;
+        int to = from + delta;
+        ArrayList<Entry> items = adapter.items;
+        if (to < 0 || to >= items.size()) {
+            return;
+        }
+        // No se cruza con las entradas fijas del final (Salir, etc.).
+        if (items.get(to).kind != KIND_APP) {
+            return;
+        }
+        Collections.swap(items, from, to);
+        pickedPosition = to;
+        adapter.notifyDataSetChanged();
+        grid.setSelection(to);
     }
 
     /** Abre el aviso del sistema para desinstalar; ahi se confirma. */
@@ -270,17 +382,47 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Lista de apps y orden guardado
+    // ------------------------------------------------------------------
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    private void saveOrder() {
+        StringBuilder sb = new StringBuilder();
+        for (Entry e : adapter.items) {
+            if (e.kind == KIND_APP && e.pkg != null) {
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(e.pkg);
+            }
+        }
+        prefs().edit().putString(KEY_ORDER, sb.toString()).apply();
+    }
+
+    private List<String> savedOrder() {
+        String s = prefs().getString(KEY_ORDER, "");
+        if (TextUtils.isEmpty(s)) {
+            return Collections.emptyList();
+        }
+        return Arrays.asList(s.split(","));
+    }
+
     private void loadEntries() {
         final boolean mode = uninstallMode;
+        final boolean move = moveMode;
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final ArrayList<Entry> list = buildEntries(mode);
+                final ArrayList<Entry> list = buildEntries(mode, move);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        if (mode != uninstallMode) {
-                            return; // el modo cambio mientras cargaba; ya hay otra carga en curso
+                        if (mode != uninstallMode || move != moveMode) {
+                            return; // el modo cambio mientras cargaba
                         }
                         adapter.setItems(list);
                         if (selectFirstNext) {
@@ -294,11 +436,11 @@ public class LauncherActivity extends Activity {
         }).start();
     }
 
-    private ArrayList<Entry> buildEntries(boolean mode) {
+    private ArrayList<Entry> buildEntries(boolean uMode, boolean mMode) {
         PackageManager pm = getPackageManager();
         ArrayList<Entry> out = new ArrayList<Entry>();
 
-        if (!mode) {
+        if (!uMode && !mMode) {
             addTvInputs(out);
         }
 
@@ -337,14 +479,9 @@ public class LauncherActivity extends Activity {
             }
         }
 
-        ArrayList<Entry> sorted = new ArrayList<Entry>(apps.values());
-        Collections.sort(sorted, new Comparator<Entry>() {
-            @Override
-            public int compare(Entry a, Entry b) {
-                return a.label.compareToIgnoreCase(b.label);
-            }
-        });
-        if (mode) {
+        ArrayList<Entry> sorted = sortByCustomOrder(apps);
+
+        if (uMode) {
             out.add(plain("Salir", "salir del modo desinstalar",
                     android.R.drawable.ic_menu_revert, KIND_UNINSTALL_OFF));
             for (Entry e : sorted) {
@@ -354,12 +491,44 @@ public class LauncherActivity extends Activity {
             }
             return out;
         }
-        out.addAll(sorted);
+        if (mMode) {
+            out.add(plain("Salir", "salir del modo mover",
+                    android.R.drawable.ic_menu_revert, KIND_MOVE_OFF));
+            out.addAll(sorted);
+            return out;
+        }
 
+        out.addAll(sorted);
+        out.add(plain("Mover apps", "cambiar el orden",
+                android.R.drawable.ic_menu_sort_alphabetically, KIND_MOVE_ON));
         out.add(plain("Desinstalar apps", "quitar apps instaladas",
                 android.R.drawable.ic_menu_delete, KIND_UNINSTALL_ON));
+        out.add(plain("Elegir fondo", "imagen o video de tu TV",
+                android.R.drawable.ic_menu_gallery, KIND_PICK_BG));
         out.add(special("Ajustes", "android.settings.SETTINGS", android.R.drawable.ic_menu_preferences));
         out.add(special("Cambiar launcher", "android.settings.HOME_SETTINGS", android.R.drawable.ic_menu_revert));
+        return out;
+    }
+
+    /** Pone primero las apps en el orden guardado; las nuevas van alfabeticas al final. */
+    private ArrayList<Entry> sortByCustomOrder(LinkedHashMap<String, Entry> apps) {
+        List<String> order = savedOrder();
+        ArrayList<Entry> out = new ArrayList<Entry>();
+        HashMap<String, Entry> pool = new HashMap<String, Entry>(apps);
+        for (String pkg : order) {
+            Entry e = pool.remove(pkg);
+            if (e != null) {
+                out.add(e);
+            }
+        }
+        ArrayList<Entry> rest = new ArrayList<Entry>(pool.values());
+        Collections.sort(rest, new Comparator<Entry>() {
+            @Override
+            public int compare(Entry a, Entry b) {
+                return a.label.compareToIgnoreCase(b.label);
+            }
+        });
+        out.addAll(rest);
         return out;
     }
 
@@ -438,6 +607,10 @@ public class LauncherActivity extends Activity {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Posters (adaptador con animacion al enfocar, estilo tvOS)
+    // ------------------------------------------------------------------
+
     private class EntryAdapter extends BaseAdapter {
         private ArrayList<Entry> items = new ArrayList<Entry>();
 
@@ -461,63 +634,204 @@ public class LauncherActivity extends Activity {
             return position;
         }
 
+        /** Estimado de columnas visibles, para que Arriba/Abajo muevan filas enteras. */
+        int columnsEstimate() {
+            int cw = grid.getColumnWidth() + dp(18);
+            int w = grid.getWidth();
+            if (cw <= 0 || w <= 0) {
+                return 4;
+            }
+            int n = w / cw;
+            return Math.max(1, n);
+        }
+
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
-            Holder h;
-            View row = convertView;
-            if (row == null) {
+            final Holder h;
+            View cell = convertView;
+            if (cell == null) {
                 LinearLayout ll = new LinearLayout(LauncherActivity.this);
                 ll.setOrientation(LinearLayout.VERTICAL);
                 ll.setGravity(Gravity.CENTER);
-                ll.setPadding(dp(8), dp(10), dp(8), dp(10));
-                ll.setLayoutParams(new AbsListView.LayoutParams(MATCH, dp(156)));
+                ll.setLayoutParams(new AbsListView.LayoutParams(MATCH, dp(176)));
 
                 h = new Holder();
+                h.card = new FrameLayout(LauncherActivity.this);
+                h.card.setBackground(makeCard(false, false));
+                FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(dp(108), dp(108));
+                ll.addView(h.card, clp);
+
                 h.icon = new ImageView(LauncherActivity.this);
                 h.icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                ll.addView(h.icon, new LinearLayout.LayoutParams(dp(84), dp(84)));
+                int m = dp(14);
+                FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(MATCH, MATCH);
+                ilp.setMargins(m, m, m, m);
+                h.card.addView(h.icon, ilp);
 
                 h.label = new TextView(LauncherActivity.this);
-                h.label.setTextSize(15);
+                h.label.setTextSize(14);
                 h.label.setTextColor(Color.WHITE);
                 h.label.setGravity(Gravity.CENTER);
-                h.label.setMaxLines(1);
+                h.label.setMaxLines(2);
                 h.label.setEllipsize(TextUtils.TruncateAt.END);
-                h.label.setPadding(0, dp(8), 0, 0);
+                h.label.setPadding(dp(4), dp(10), dp(4), 0);
                 ll.addView(h.label, new LinearLayout.LayoutParams(MATCH,
                         ViewGroup.LayoutParams.WRAP_CONTENT));
 
                 ll.setTag(h);
-                row = ll;
+                cell = ll;
             } else {
-                h = (Holder) row.getTag();
+                h = (Holder) cell.getTag();
             }
+
             Entry e = items.get(position);
             h.icon.setImageDrawable(e.icon);
-            if (uninstallMode && e.kind == KIND_APP) {
-                h.label.setMaxLines(2);
-                h.label.setTextSize(13);
+
+            boolean selected = position == grid.getSelectedItemPosition();
+            boolean picked = position == pickedPosition;
+
+            h.card.setBackground(makeCard(selected, picked));
+            h.card.setScaleX(selected ? 1.18f : 1f);
+            h.card.setScaleY(selected ? 1.18f : 1f);
+            h.card.setTranslationY(selected ? -dp(6) : 0);
+
+            if (e.kind == KIND_APP && uninstallMode) {
                 h.label.setText(e.label + "\n" + shortPkg(e.pkg));
             } else {
-                h.label.setMaxLines(1);
-                h.label.setTextSize(15);
                 h.label.setText(e.label);
             }
-            return row;
+            h.label.setVisibility(selected || picked ? View.VISIBLE : View.INVISIBLE);
+            h.label.setTextColor(picked ? 0xFFFFD54F : Color.WHITE);
+
+            return cell;
         }
     }
 
-    private Drawable makeSelector() {
+    private Drawable makeCard(boolean selected, boolean picked) {
         GradientDrawable g = new GradientDrawable();
-        g.setColor(0x33FFFFFF);
-        g.setCornerRadius(dp(14));
-        g.setStroke(dp(2), 0xCCFFFFFF);
+        g.setCornerRadius(dp(18));
+        if (picked) {
+            g.setColor(0x552196F3);
+            g.setStroke(dp(3), 0xFFFFD54F);
+        } else if (selected) {
+            g.setColor(0x33FFFFFF);
+            g.setStroke(dp(3), 0xFFFFFFFF);
+        } else {
+            g.setColor(0x1AFFFFFF);
+            g.setStroke(dp(1), 0x33FFFFFF);
+        }
         return g;
     }
 
     // ------------------------------------------------------------------
-    // Fondo (degradado animado, imagen o video)
+    // Fondo: elegido desde la app, carpeta "Fondos", o degradado animado
     // ------------------------------------------------------------------
+
+    /** Abre el selector de archivos del sistema para elegir una imagen o video. */
+    private void pickBackground() {
+        try {
+            Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*"});
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(Intent.createChooser(i, "Elegir fondo"), REQ_PICK_BG);
+        } catch (Exception e) {
+            Toast.makeText(this, "Esta TV no tiene un selector de archivos "
+                    + "(" + e.getClass().getSimpleName() + "). Usa una carpeta \"Fondos\" en una USB.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, final Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_BG || resultCode != RESULT_OK || data == null || data.getData() == null) {
+            return;
+        }
+        final Uri uri = data.getData();
+        Toast.makeText(this, "Copiando fondo…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final boolean ok = saveCustomBackground(uri);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (ok) {
+                            currentBgKey = null;
+                            loadBackground();
+                            Toast.makeText(LauncherActivity.this, "Fondo actualizado", Toast.LENGTH_SHORT).show();
+                        } else {
+                            Toast.makeText(LauncherActivity.this,
+                                    "No se pudo usar ese archivo como fondo", Toast.LENGTH_LONG).show();
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private boolean saveCustomBackground(Uri uri) {
+        String ext = guessExtension(uri);
+        if (!hasExt("x." + ext, VIDEO_EXT) && !hasExt("x." + ext, IMAGE_EXT)) {
+            ext = "jpg"; // formato no identificado: se intenta como imagen
+        }
+        File dir = getFilesDir();
+        clearBackgroundFiles(dir);
+        File tmp = new File(dir, "fondo_personalizado.tmp");
+        InputStream in = null;
+        OutputStream out = null;
+        try {
+            in = getContentResolver().openInputStream(uri);
+            if (in == null) {
+                return false;
+            }
+            out = new FileOutputStream(tmp);
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+        } catch (Exception e) {
+            tmp.delete();
+            return false;
+        } finally {
+            closeQuietly(in);
+            closeQuietly(out);
+        }
+        File dest = new File(dir, "fondo_personalizado." + ext);
+        return tmp.renameTo(dest);
+    }
+
+    private String guessExtension(Uri uri) {
+        Cursor c = null;
+        try {
+            c = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (c != null && c.moveToFirst()) {
+                String name = c.getString(0);
+                if (name != null && name.contains(".")) {
+                    return extensionOf(name);
+                }
+            }
+        } catch (Exception ignored) {
+            // se intenta por el tipo MIME
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        String type = getContentResolver().getType(uri);
+        if (type != null) {
+            if (type.startsWith("video/")) {
+                return type.contains("webm") ? "webm" : "mp4";
+            }
+            if (type.contains("png")) {
+                return "png";
+            }
+        }
+        return "jpg";
+    }
 
     private void showDefaultBackground() {
         bgFrame.removeAllViews();
@@ -595,12 +909,25 @@ public class LauncherActivity extends Activity {
     }
 
     /**
-     * Busca un archivo de fondo en carpetas llamadas "Fondos". Si lo encuentra,
-     * lo copia al almacenamiento interno de la app para que siga funcionando
-     * aunque se quite la memoria USB.
+     * Orden de busqueda del fondo: 1) el elegido desde la app, 2) una carpeta
+     * "Fondos" en USB o almacenamiento (se copia una vez al almacenamiento
+     * interno), 3) ninguno (se usa el degradado).
      */
     private File resolveBackground() {
         File dir = getFilesDir();
+        for (String e : VIDEO_EXT) {
+            File f = new File(dir, "fondo_personalizado." + e);
+            if (f.exists()) {
+                return f;
+            }
+        }
+        for (String e : IMAGE_EXT) {
+            File f = new File(dir, "fondo_personalizado." + e);
+            if (f.exists()) {
+                return f;
+            }
+        }
+
         File found = findBackgroundSource();
         if (found != null) {
             File dest = new File(dir, "fondo." + extensionOf(found.getName()));
@@ -632,6 +959,18 @@ public class LauncherActivity extends Activity {
             }
         }
         return null;
+    }
+
+    private void clearBackgroundFiles(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            if (f.getName().startsWith("fondo_personalizado.")) {
+                f.delete();
+            }
+        }
     }
 
     private void deleteCachedBackgrounds(File dir) {
